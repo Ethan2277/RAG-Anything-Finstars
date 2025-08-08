@@ -8,6 +8,8 @@ import os
 import time
 import hashlib
 import json
+import aiofiles
+import base64
 from typing import Dict, List, Any, Tuple
 from pathlib import Path
 from raganything.parser import MineruParser, DoclingParser
@@ -259,6 +261,94 @@ class ProcessorMixin:
         except Exception as e:
             self.logger.warning(f"Error storing to parse cache: {e}")
 
+    async def _save_file_content(self, file_path: str | Path, file_content: str | bytes):
+        """
+        Save file content to a specified directory with the given file name and type.
+        Args:
+            directory: Directory where the file will be saved
+            file_name: Name of the file to be saved
+            file_type: Type of the file (e.g., 'txt', 'pdf')
+            file_content: Content of the file to be saved as bytes
+        Returns:
+            str: Full path to the saved file
+        Raises:
+            OSError: If the directory cannot be created or file cannot be written
+        """
+        if isinstance(file_path, str):
+            file_path = Path(file_path)
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        if file_path.suffix == ".txt":
+            try:
+                async with aiofiles.open(file_path, 'w', encoding='utf-8') as f:
+                    await f.write(file_content.decode('utf-8'))
+                return file_path
+            except OSError as e:
+                self.logger.error(f"Error writing file {file_path}: {e}")
+                raise
+        elif file_path.suffix == ".pdf":
+            try:
+                async with aiofiles.open(file_path, 'wb') as f:
+                    if isinstance(file_content, str):
+                        file_content = base64.b64decode(file_content.encode('utf-8'))
+                    elif isinstance(file_content, bytes):
+                        file_content = base64.b64decode(file_content)
+                    else:
+                        self.logger.error(f"Base64 content must be str or bytes, got {type(file_content)}")
+                        raise TypeError("Base64 content must be str or bytes")
+                    await f.write(file_content)
+                return file_path
+            except OSError as e:
+                self.logger.error(f"Error writing file {file_path}: {e}")
+                raise
+        else:
+            self.logger.error(f"Unsupported file type")
+            raise NotImplementedError(f"Unsupported file type")
+
+    async def _read_file_content(self, file_path: str | Path):
+        """
+        Read file content from a specified directory with the given file name and type.
+        Args:
+            directory: Directory where the file is located
+            file_name: Name of the file to be read
+            file_type: Type of the file (e.g., 'txt', 'pdf')
+        Returns:
+            str: Content of the file as a string (for text files) or base64 encoded string (for PDF files)
+        Raises:
+            FileNotFoundError: If the file does not exist
+        """
+        if isinstance(file_path, str):
+            file_path = Path(file_path)
+        try:
+            file_type = file_path.suffix.lower()
+            if file_type == ".txt":
+                async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
+                    return await f.read()
+            elif file_type == ".pdf":
+                async with aiofiles.open(file_path, 'rb') as f:
+                    return base64.b64encode(await f.read()).decode('utf-8')
+            else:
+                self.logger.error(f"Unsupported file type: {file_path}")
+                raise NotImplementedError(f"Unsupported file type: {file_path}")
+        except FileNotFoundError:
+            self.logger.error(f"File not found: {file_path}")
+            raise
+        except NotImplementedError:
+            self.logger.error(f"Unsupported file type: {file_type}")
+            raise
+        
+    def _generate_temporary_path(self, file_name: str) -> str:
+        tmp_dir = '.tmp/'
+        if self._check_multi_session_management():
+            tmp_dir = tmp_dir + str(self.config.user_id) + '/' + str(self.config.session_id) + '/'
+        input_dir = tmp_dir + 'input/'
+        output_dir = tmp_dir + 'output/'
+        # Ensure the temporary path exists
+        os.makedirs(input_dir, exist_ok=True)
+        os.makedirs(output_dir, exist_ok=True)
+
+        file_path = os.path.join(input_dir, file_name)
+        return file_path, output_dir
+    
     async def parse_document(
         self,
         file_path: str,
@@ -309,100 +399,123 @@ class ProcessorMixin:
                     f"* Total blocks in cached content_list: {len(content_list)}"
                 )
             return content_list, doc_id
-
-        # Choose appropriate parsing method based on file extension
-        ext = file_path.suffix.lower()
-
-        try:
-            doc_parser = (
-                DoclingParser() if self.config.parser == "docling" else MineruParser()
-            )
-
-            # Log parser and method information
-            self.logger.info(
-                f"Using {self.config.parser} parser with method: {parse_method}"
-            )
-
-            if ext in [".pdf"]:
-                self.logger.info("Detected PDF file, using parser for PDF...")
-                content_list = doc_parser.parse_pdf(
-                    pdf_path=file_path,
-                    output_dir=output_dir,
-                    method=parse_method,
-                    **kwargs,
+        
+        content_list, doc_id = [], None
+        if self._check_resource_management() and self._check_resource_storage_initialized():
+            parse_content = await self.parsed_content.get_all()
+            file_content = await self._read_file_content(file_path)
+            doc_id = compute_mdhash_id(file_content, prefix='doc_')
+            content_list = [json.loads(parse_content[content_id].get('content')) \
+                for content_id in parse_content if parse_content[content_id].get('doc_id') == doc_id]
+            
+        if content_list is not None and len(content_list) > 0:
+            self.logger.info("Found parsed content in resource storage, using it directly")
+            if display_stats:
+                self.logger.info(
+                    f"* Total blocks in parsed content_list: {len(content_list)}"
                 )
-            elif ext in [
-                ".jpg",
-                ".jpeg",
-                ".png",
-                ".bmp",
-                ".tiff",
-                ".tif",
-                ".gif",
-                ".webp",
-            ]:
-                self.logger.info("Detected image file, using parser for images...")
-                # Use the selected parser's image parsing capability
-                if hasattr(doc_parser, "parse_image"):
-                    content_list = doc_parser.parse_image(
-                        image_path=file_path, output_dir=output_dir, **kwargs
+        else:        
+            # Choose appropriate parsing method based on file extension
+            ext = file_path.suffix.lower()
+
+            try:
+                doc_parser = (
+                    DoclingParser() if self.config.parser == "docling" else MineruParser()
+                )
+
+                # Log parser and method information
+                self.logger.info(
+                    f"Using {self.config.parser} parser with method: {parse_method}"
+                )
+
+                if ext in [".pdf"]:
+                    self.logger.info("Detected PDF file, using parser for PDF...")
+                    content_list = doc_parser.parse_pdf(
+                        pdf_path=file_path,
+                        output_dir=output_dir,
+                        method=parse_method,
+                        **kwargs,
+                    )
+                elif ext in [
+                    ".jpg",
+                    ".jpeg",
+                    ".png",
+                    ".bmp",
+                    ".tiff",
+                    ".tif",
+                    ".gif",
+                    ".webp",
+                ]:
+                    self.logger.info("Detected image file, using parser for images...")
+                    # Use the selected parser's image parsing capability
+                    if hasattr(doc_parser, "parse_image"):
+                        content_list = doc_parser.parse_image(
+                            image_path=file_path, output_dir=output_dir, **kwargs
+                        )
+                    else:
+                        # Fallback to MinerU for image parsing if current parser doesn't support it
+                        self.logger.warning(
+                            f"{self.config.parser} parser doesn't support image parsing, falling back to MinerU"
+                        )
+                        content_list = MineruParser().parse_image(
+                            image_path=file_path, output_dir=output_dir, **kwargs
+                        )
+                elif ext in [
+                    ".doc",
+                    ".docx",
+                    ".ppt",
+                    ".pptx",
+                    ".xls",
+                    ".xlsx",
+                    ".html",
+                    ".htm",
+                    ".xhtml",
+                ]:
+                    self.logger.info(
+                        "Detected Office or HTML document, using parser for Office/HTML..."
+                    )
+                    content_list = doc_parser.parse_office_doc(
+                        doc_path=file_path, output_dir=output_dir, **kwargs
                     )
                 else:
-                    # Fallback to MinerU for image parsing if current parser doesn't support it
-                    self.logger.warning(
-                        f"{self.config.parser} parser doesn't support image parsing, falling back to MinerU"
+                    # For other or unknown formats, use generic parser
+                    self.logger.info(
+                        f"Using generic parser for {ext} file (method={parse_method})..."
                     )
-                    content_list = MineruParser().parse_image(
-                        image_path=file_path, output_dir=output_dir, **kwargs
+                    content_list = doc_parser.parse_document(
+                        file_path=file_path,
+                        method=parse_method,
+                        output_dir=output_dir,
+                        **kwargs,
                     )
-            elif ext in [
-                ".doc",
-                ".docx",
-                ".ppt",
-                ".pptx",
-                ".xls",
-                ".xlsx",
-                ".html",
-                ".htm",
-                ".xhtml",
-            ]:
-                self.logger.info(
-                    "Detected Office or HTML document, using parser for Office/HTML..."
+
+            except Exception as e:
+                self.logger.error(
+                    f"Error during parsing with {self.config.parser} parser: {str(e)}"
                 )
-                content_list = doc_parser.parse_office_doc(
-                    doc_path=file_path, output_dir=output_dir, **kwargs
-                )
-            else:
-                # For other or unknown formats, use generic parser
-                self.logger.info(
-                    f"Using generic parser for {ext} file (method={parse_method})..."
-                )
-                content_list = doc_parser.parse_document(
+                self.logger.warning("Falling back to MinerU parser...")
+                # If specific parser fails, fall back to MinerU parser
+                content_list = MineruParser().parse_document(
                     file_path=file_path,
                     method=parse_method,
                     output_dir=output_dir,
                     **kwargs,
                 )
 
-        except Exception as e:
-            self.logger.error(
-                f"Error during parsing with {self.config.parser} parser: {str(e)}"
-            )
-            self.logger.warning("Falling back to MinerU parser...")
-            # If specific parser fails, fall back to MinerU parser
-            content_list = MineruParser().parse_document(
-                file_path=file_path,
-                method=parse_method,
-                output_dir=output_dir,
-                **kwargs,
+            self.logger.info(
+                f"Parsing complete! Extracted {len(content_list)} content blocks"
             )
 
-        self.logger.info(
-            f"Parsing complete! Extracted {len(content_list)} content blocks"
-        )
-
-        # Generate doc_id based on content
-        doc_id = self._generate_content_based_doc_id(content_list)
+            if self._check_resource_management() and self._check_resource_storage_initialized():
+                await self.store_parsed_result_resource(
+                    input_file_path=file_path,
+                    parser_output_dir=output_dir,
+                    parse_method=parse_method,
+                    **kwargs
+                )
+            
+            # Generate doc_id based on content
+            doc_id = self._generate_content_based_doc_id(content_list)
 
         # Store result in cache
         await self._store_cached_result(
@@ -427,6 +540,45 @@ class ProcessorMixin:
                 self.logger.info(f"  - {block_type}: {count}")
 
         return content_list, doc_id
+    
+    async def parse_document_data(
+        self,
+        file_data: dict[str, Any],
+        parse_method: str = None,
+        display_stats: bool = None,
+        **kwargs,
+    ) -> tuple[List[Dict[str, Any]], str]:
+        """
+        Parse document data from a dictionary containing file information.
+
+        Args:
+            file_data: A dictionary containing 'file_name' and 'file_content' keys.
+            parse_method: The parsing method to use (optional).
+            display_stats: Whether to display parsing statistics (optional).
+            **kwargs: Additional keyword arguments for parsing.
+
+        Returns:
+            A tuple containing a list of parsed content blocks and the document ID.
+        """
+        if "file_name" not in file_data:
+            raise ValueError("file_data must contain 'file_name' key")
+        if "file_content" not in file_data:
+            raise ValueError("file_data must contain 'file_content' key")
+        file_name = file_data["file_name"]
+        file_content = file_data["file_content"]
+        file_path, output_dir = self._generate_temporary_path(file_name=file_name)
+        # Save the file content to a file in the temporary path
+        await self._save_file_content(
+            file_path=file_path,
+            file_content=file_content
+        )
+        return await self.parse_document(
+            file_path=file_path,
+            output_dir=output_dir,
+            parse_method=parse_method,
+            display_stats=display_stats,
+            **kwargs,
+        )
 
     async def _process_multimodal_content(
         self, multimodal_items: List[Dict[str, Any]], file_path: str, doc_id: str
@@ -1314,6 +1466,16 @@ class ProcessorMixin:
             file_path, output_dir, parse_method, display_stats, **kwargs
         )
 
+        if self._check_resource_management() and self._check_resource_storage_initialized():
+            self.logger.info("Resource management enabled, storing input file and parsed results...")
+            await self.store_input_file_resource(file_path=file_path)
+            await self.store_parsed_result_resource(
+                input_file_path=file_path,
+                parser_output_dir=output_dir,
+                parse_method=parse_method,
+                **kwargs
+            )
+
         # Use provided doc_id or fall back to content-based doc_id
         if doc_id is None:
             doc_id = content_based_doc_id
@@ -1355,6 +1517,64 @@ class ProcessorMixin:
 
         self.logger.info(f"Document {file_path} processing complete!")
 
+    async def process_document_data_complete(
+        self,
+        file_data: dict[str, Any],
+        parse_method: str = None,
+        display_stats: bool = None,
+        split_by_character: str | None = None,
+        split_by_character_only: bool = False,
+        doc_id: str | None = None,
+        **kwargs,
+    ):
+        """
+        Complete database rsource processing workflow
+
+        Args:
+            file_data: File data to be processed
+            parse_method: Parse method (defaults to config.parse_method)
+            display_stats: Whether to display content statistics (defaults to config.display_content_stats)
+            split_by_character: Optional character to split the text by
+            split_by_character_only: If True, split only by the specified character
+            doc_id: Optional document ID, if not provided will be generated from content
+            **kwargs: Additional parameters for parser (e.g., lang, device, start_page, end_page, formula, table, backend, source)
+        """
+        if "file_name" not in file_data:
+            raise ValueError("file_data must contain 'file_name' key")
+        if "file_content" not in file_data:
+            raise ValueError("file_data must contain 'file_content' key")
+        
+        file_name = file_data["file_name"]
+        file_content = file_data["file_content"]
+        
+        # Ensure LightRAG is initialized
+        await self._ensure_lightrag_initialized()
+
+        # Use config defaults if not provided
+        if parse_method is None:
+            parse_method = self.config.parse_method
+        if display_stats is None:
+            display_stats = self.config.display_content_stats
+
+        file_path, output_dir = self._generate_temporary_path(file_name=file_name)
+
+        # Save the file content to a file in the temporary path
+        await self._save_file_content(
+            file_path=file_path,
+            file_content=file_content
+        )
+        
+        await self.process_document_complete(
+            file_path=str(file_path),
+            output_dir=str(output_dir),
+            parse_method=parse_method,
+            display_stats=display_stats,
+            split_by_character=split_by_character,
+            split_by_character_only=split_by_character_only,
+            doc_id=doc_id,
+            **kwargs
+        )
+
     async def insert_content_list(
         self,
         content_list: List[Dict[str, Any]],
@@ -1392,68 +1612,76 @@ class ProcessorMixin:
         # Ensure LightRAG is initialized
         await self._ensure_lightrag_initialized()
 
-        # Use config defaults if not provided
-        if display_stats is None:
-            display_stats = self.config.display_content_stats
-
-        self.logger.info(
-            f"Starting direct content list insertion for: {file_path} ({len(content_list)} items)"
-        )
-
-        # Generate doc_id based on content if not provided
-        if doc_id is None:
-            doc_id = self._generate_content_based_doc_id(content_list)
-
-        # Display content statistics if requested
-        if display_stats:
-            self.logger.info("\nContent Information:")
-            self.logger.info(f"* Total blocks in content_list: {len(content_list)}")
-
-            # Count elements by type
-            block_types: Dict[str, int] = {}
-            for block in content_list:
-                if isinstance(block, dict):
-                    block_type = block.get("type", "unknown")
-                    if isinstance(block_type, str):
-                        block_types[block_type] = block_types.get(block_type, 0) + 1
-
-            self.logger.info("* Content block types:")
-            for block_type, count in block_types.items():
-                self.logger.info(f"  - {block_type}: {count}")
-
-        # Step 1: Separate text and multimodal content
-        text_content, multimodal_items = separate_content(content_list)
-
-        # Step 1.5: Set content source for context extraction in multimodal processing
-        if hasattr(self, "set_content_source_for_context") and multimodal_items:
-            self.logger.info(
-                "Setting content source for context-aware multimodal processing..."
+        if self._check_resource_management() and self._check_resource_storage_initialized():
+            self.logger.info("Resource management enabled, storing parsed content list...")
+            await self.store_parsed_content_list_resource(
+                input_file_path = file_path,
+                parsed_content_list=content_list,
             )
-            self.set_content_source_for_context(
-                content_list, self.config.content_format
-            )
+            return
 
-        # Step 2: Insert pure text content with all parameters
-        if text_content.strip():
-            file_name = os.path.basename(file_path)
-            await insert_text_content(
-                self.lightrag,
-                text_content,
-                file_paths=file_name,
-                split_by_character=split_by_character,
-                split_by_character_only=split_by_character_only,
-                ids=doc_id,
-            )
+        # # Use config defaults if not provided
+        # if display_stats is None:
+        #     display_stats = self.config.display_content_stats
 
-        # Step 3: Process multimodal content (using specialized processors)
-        if multimodal_items:
-            await self._process_multimodal_content(multimodal_items, file_path, doc_id)
-        else:
-            # If no multimodal content, mark multimodal processing as complete
-            # This ensures the document status properly reflects completion of all processing
-            await self._mark_multimodal_processing_complete(doc_id)
-            self.logger.debug(
-                f"No multimodal content found in document {doc_id}, marked multimodal processing as complete"
-            )
+        # self.logger.info(
+        #     f"Starting direct content list insertion for: {file_path} ({len(content_list)} items)"
+        # )
 
-        self.logger.info(f"Content list insertion complete for: {file_path}")
+        # # Generate doc_id based on content if not provided
+        # if doc_id is None:
+        #     doc_id = self._generate_content_based_doc_id(content_list)
+
+        # # Display content statistics if requested
+        # if display_stats:
+        #     self.logger.info("\nContent Information:")
+        #     self.logger.info(f"* Total blocks in content_list: {len(content_list)}")
+
+        #     # Count elements by type
+        #     block_types: Dict[str, int] = {}
+        #     for block in content_list:
+        #         if isinstance(block, dict):
+        #             block_type = block.get("type", "unknown")
+        #             if isinstance(block_type, str):
+        #                 block_types[block_type] = block_types.get(block_type, 0) + 1
+
+        #     self.logger.info("* Content block types:")
+        #     for block_type, count in block_types.items():
+        #         self.logger.info(f"  - {block_type}: {count}")
+
+        # # Step 1: Separate text and multimodal content
+        # text_content, multimodal_items = separate_content(content_list)
+
+        # # Step 1.5: Set content source for context extraction in multimodal processing
+        # if hasattr(self, "set_content_source_for_context") and multimodal_items:
+        #     self.logger.info(
+        #         "Setting content source for context-aware multimodal processing..."
+        #     )
+        #     self.set_content_source_for_context(
+        #         content_list, self.config.content_format
+        #     )
+
+        # # Step 2: Insert pure text content with all parameters
+        # if text_content.strip():
+        #     file_name = os.path.basename(file_path)
+        #     await insert_text_content(
+        #         self.lightrag,
+        #         text_content,
+        #         file_paths=file_name,
+        #         split_by_character=split_by_character,
+        #         split_by_character_only=split_by_character_only,
+        #         ids=doc_id,
+        #     )
+
+        # # Step 3: Process multimodal content (using specialized processors)
+        # if multimodal_items:
+        #     await self._process_multimodal_content(multimodal_items, file_path, doc_id)
+        # else:
+        #     # If no multimodal content, mark multimodal processing as complete
+        #     # This ensures the document status properly reflects completion of all processing
+        #     await self._mark_multimodal_processing_complete(doc_id)
+        #     self.logger.debug(
+        #         f"No multimodal content found in document {doc_id}, marked multimodal processing as complete"
+        #     )
+
+        # self.logger.info(f"Content list insertion complete for: {file_path}")

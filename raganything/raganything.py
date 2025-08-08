@@ -30,6 +30,8 @@ from raganything.config import RAGAnythingConfig
 from raganything.query import QueryMixin
 from raganything.processor import ProcessorMixin
 from raganything.batch import BatchMixin
+from raganything.resource import ResourceMixin
+from raganything.session import SessionConfigMixin
 from raganything.utils import get_processor_supports
 from raganything.parser import MineruParser, DoclingParser
 
@@ -45,7 +47,7 @@ from raganything.modalprocessors import (
 
 
 @dataclass
-class RAGAnything(QueryMixin, ProcessorMixin, BatchMixin):
+class RAGAnything(QueryMixin, ProcessorMixin, BatchMixin, ResourceMixin, SessionConfigMixin):
     """Multimodal Document Processing Pipeline - Complete document parsing and insertion pipeline"""
 
     # Core Components
@@ -236,6 +238,11 @@ class RAGAnything(QueryMixin, ProcessorMixin, BatchMixin):
                 not hasattr(self.lightrag, "_storages_status")
                 or self.lightrag._storages_status.name != "INITIALIZED"
             ):
+                 # Modify configuration for multi-session management if enabled
+                if self._check_multi_session_management():
+                    await self._modify_lightrag_config_for_session(user_id=self.config.user_id, 
+                                                                session_id=self.config.session_id, 
+                                                                lightrag_params=lightrag_params)
                 self.logger.info(
                     "Initializing storages for pre-provided LightRAG instance"
                 )
@@ -243,6 +250,13 @@ class RAGAnything(QueryMixin, ProcessorMixin, BatchMixin):
                 from lightrag.kg.shared_storage import initialize_pipeline_status
 
                 await initialize_pipeline_status()
+            else:
+                # Check if multi-session management is enabled
+                if self._check_multi_session_management():
+                    logger.warning(
+                        "LightRAG is already initialized, multi-session management may not work as expected."
+                    )
+                    return
 
             # Initialize parse cache if not already done
             if self.parse_cache is None:
@@ -293,12 +307,22 @@ class RAGAnything(QueryMixin, ProcessorMixin, BatchMixin):
             and k not in ["llm_model_kwargs", "vector_db_storage_cls_kwargs"]
         }
         self.logger.info(f"Initializing LightRAG with parameters: {log_params}")
+        
+        # Modify configuration for multi-session management if enabled
+        if self._check_multi_session_management():
+            await self._modify_lightrag_config_for_session(user_id=self.config.user_id, 
+                                                           session_id=self.config.session_id, 
+                                                           lightrag_params=lightrag_params)
 
         # Create LightRAG instance with merged parameters
         self.lightrag = LightRAG(**lightrag_params)
 
         await self.lightrag.initialize_storages()
         await initialize_pipeline_status()
+        
+        # Initialize resource storage if resource management is enabled
+        if self._check_resource_management():
+            await self._initialize_resources_storage()
 
         # Initialize parse cache storage using LightRAG's KV storage
         self.parse_cache = self.lightrag.key_string_value_json_storage_cls(

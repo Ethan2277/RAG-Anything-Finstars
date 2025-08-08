@@ -17,7 +17,20 @@ class RAGAnythingConfig:
     # ---
     working_dir: str = field(default=get_env_value("WORKING_DIR", "./rag_storage", str))
     """Directory where RAG storage and cache files are stored."""
+    
+    # Resource Configuration
+    # ---
+    resource_management: bool = field(default=get_env_value("RESOURCE_MANAGEMENT", True, bool))
+    """Whether to manage resources for document processing."""
 
+    # Multi-session Configuration
+    # ---
+    user_id: str = field(default=get_env_value("USER_ID", None, str))
+    """Unique identifier for the user session. If not set, defaults to None."""
+    
+    session_id: str = field(default=get_env_value("SESSION_ID", None, str))
+    """Unique identifier for the session. If not set, defaults to None."""
+    
     # Parser Configuration
     # ---
     parse_method: str = field(default=get_env_value("PARSE_METHOD", "auto", str))
